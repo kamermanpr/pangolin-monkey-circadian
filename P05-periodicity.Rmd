@@ -1,0 +1,974 @@
+---
+title: 'Pangolin ID: P05'
+subtitle: 'Periodicity analysis'
+author: 'Peter Kamerman'
+date: "Last updated: `r format(Sys.Date(), '%d %b %Y')`"
+---
+
+```{r setup, include = FALSE}
+# Load packages
+library(magrittr)
+library(tidyverse)
+library(ggfortify)
+library(ggridges)
+library(lubridate)
+library(multitaper)
+library(skimr)
+library(zoo)
+
+# Make figure directory
+if(!dir.exists('figures/P05-periodicity')) {
+    dir.create('figures/P05-periodicity')
+}
+
+# knitr setup
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE,
+                      fig.retina = 2,
+                      fig.align = 'center',
+                      fig.path = 'figures/P05-periodicity/')
+```
+
+----
+
+This script includes analyses on whether there is evidence of circadian variation in body temperature in pangolins. The analysis is for one animal (**P05**) and includes chronograms, actograms, periodgrams, and autocorrelation.
+
+----
+
+## Import and summarise data
+
+### Import
+
+```{r import_data}
+# Body temperature data
+data <- read_rds('data-cleaned/pangolin/P05-cleaned.rds')
+
+# Globe data
+globe <- read_rds(path = 'data-cleaned/pangolin/globe-temp.rds')
+
+# Import photoperiod data
+photo <- read_rds(path = 'data-cleaned/pangolin/photo-period.rds')
+```
+
+### Summarise
+
+```{r quick_look, results = 'asis'}
+kable(skim(data))
+```
+
+----
+
+## Process data
+
+```{r process_data}
+#-- Generate separate day, month, and year columns --#
+data %<>%
+    mutate(day = day(date),
+           month = month(date, 
+                         label = TRUE),
+           year = as.character(year(date)))
+
+#-- Smooth body temp data --#
+## Rolling smooth over 60 minutes (alignment = centered)
+data %<>%
+    mutate(temp_smooth = round(rollapply(data = body_temp,
+                                   FUN = mean,
+                                   width = 12,
+                                   partial = TRUE,
+                                   align = 'center'), 2))
+
+#-- Define animal ID --#
+animal <- data$ID[[1]]
+
+#-- Photo-period: generate separate day, month, year columns --#
+photo %<>%
+    mutate(day = day(date),
+           month = month(date, 
+                         label = TRUE,
+                         abbr = FALSE),
+           year = as.character(year(date)))
+
+#-- Photo-period: spread time of sunrise/sunset
+photo_wide <- photo %>% 
+    spread(key = event, 
+           value = time) %>% 
+    group_by(date) %>% 
+    # Shift sunset up one row
+    mutate(sunset = lead(sunset)) %>% 
+    ungroup() %>% 
+    # Remove empty rows
+    filter(!is.na(sunset)) %>% 
+    arrange(date)
+
+#-- Photo-period: filter to length of 'data' --#
+photo_wide %<>%
+    filter(date %in% data$date)
+```
+
+----
+
+## Daily summary line plots
+
+```{r daily_summary, fig.height = 8, fig.width = 7}
+#-- Body temp --#
+data_summary <- data %>%
+    # Group and summarise
+    group_by(date) %>%
+    summarise(mean = mean(body_temp, na.rm = TRUE),
+              min = min(body_temp, na.rm = TRUE),
+              max = max(body_temp, na.rm = TRUE)) %>%
+    ungroup() %>%
+    # Add dummy time column and rejoin with data
+    mutate(time = '12:00:00') %>%
+    left_join(data) %>%
+    # Clean-up
+    select(date, period, mean, min, max) %>% 
+    # Add body temp label
+    mutate(type = 'Body temperature')
+
+#-- Globe --#
+globe_summary <- globe %>%
+    # Group and summarise
+    group_by(date) %>%
+    summarise(mean = mean(globe_temp, na.rm = TRUE),
+              min = min(globe_temp, na.rm = TRUE),
+              max = max(globe_temp, na.rm = TRUE)) %>%
+    ungroup() %>%
+    # Add dummy time column and rejoin with data
+    mutate(time = '12:00:00') %>%
+    left_join(globe) %>%
+    # Clean-up
+    select(date, period, mean, min, max) %>%
+    mutate(mean = ifelse(is.nan(mean),
+                         yes = NA,
+                         no = mean),
+           min = ifelse(is.infinite(min),
+                        yes = NA,
+                        no = min),
+           max = ifelse(is.infinite(max),
+                        yes = NA,
+                        no = max))
+
+#-- Globe filtered --#
+# Create list of globe temps limited to body temp range of the animal
+globe_filtered <- data_summary %>%
+    select(date) %>%
+    left_join(globe_summary) %>%
+    # Add a globe temp label
+    mutate(type = 'Globe temperature')
+
+# Bind the globe and body temp data together
+plot_data <- data_summary %>%
+    # Bind
+    bind_rows(globe_filtered) %>%
+    # Convert date to ymd format
+    mutate(date = ymd(date))
+
+#-- Plot --#
+ggplot(data = plot_data) +
+    aes(x = date) +
+    geom_ribbon(aes(ymax = max, ymin = min), fill = 'wheat2') +
+    geom_line(aes(y = mean)) +
+    geom_line(aes(y = max), colour = 'wheat3') +
+    geom_line(aes(y = min), colour = 'wheat3') +
+    labs(title = str_glue('{animal}: Daily mean and range in body and black globe temperature'),
+         subtitle = 'Black line: daily mean \nShaded area: daily range',
+         x = 'Date',
+         y = expression(Temperature~(degree*C))) +
+    scale_x_date(date_breaks = '2 months',
+                 date_labels = '%b %Y') +
+    facet_wrap(~ type,
+               ncol = 1,
+               scales = 'free_y') +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1),
+          panel.grid.minor = element_blank())
+
+```
+----
+
+## Chronograms
+
+As a preliminary assessment of whether there may be circadian osscilation in body temperature, we plotted chronograms of raw and smoothed _(rolling 60-minute average)_ body temperature data for each month in a calendar year. 
+
+### Year facetted by month
+
+```{r chronogram_ymd, fig.height = 10, fig.width = 8}
+#-- Nest data by year --#
+chronograms <- data %>% 
+    group_by(year) %>% 
+    nest()
+
+#-- Plot chronograms by month within each year --#
+chronograms %<>%
+    # Add dummy date and date-time for plotting
+    mutate(data = map(.x = data,
+                      ~ .x %>% 
+                          mutate(dummy_date_time = ymd_hms(paste0('2000-01-', day, ' ', time)),
+                                 dummy_date = ymd_hms(paste0('2000-01-', day, ' 00:00:00'))))) %>% 
+    # Plot
+    mutate(chronograms = pmap(.l = list(data, year, animal),
+                              ~ ggplot(data = ..1) +
+                                  aes(x = dummy_date_time,
+                                      y = body_temp) +
+                                  geom_vline(aes(xintercept = dummy_date), 
+                                             colour = '#2678B2') +
+                                  geom_point(shape = 21,
+                                             stroke = 0.2,
+                                             fill = '#FFFFFF') +
+                                  geom_line(aes(y = temp_smooth),
+                                            colour = '#FD7F28') +
+                                  labs(title = str_glue('{..3}: {..2} monthly chronogram'), 
+                                       subtitle = 'Open circles: 5-minute temperature data \nOrange line: Smoothed temperature data (60-minute rolling mean, center aligned) \nBlue vertical lines: Midnight of each day',
+                                       x = 'Day of month',
+                                       y = expression(Body~temperature~(degree~C))) +
+                                  scale_x_datetime(date_breaks = '2 days',
+                                                   expand = c(0, 0),
+                                                   date_labels = '%d') +
+                                  scale_y_continuous(limits = c(30, 38)) +
+                                  facet_grid(month ~ .,
+                                             drop = FALSE) +
+                                  theme_bw(base_size = 12) +
+                                  theme(panel.grid.minor = element_blank())))
+
+# Print plots
+walk(chronograms$chronograms, 
+     ~print(.x))
+```
+
+----
+
+## Actograms
+
+We then refined the visual inspection of the data for evidence of a circadian rhythm of body temperature by constructing monthly actograms that plotted difference in body temperature _(averaged across 48 30-minute bins per day)_ from the daily mean body temperature for each day of a given month.  
+
+```{r actograms, fig.height = 10, fig.width = 8}
+# Prepare photo-period data for plotting
+photo_actogram <- photo_wide %>% 
+    mutate(sunset = ymd_hms(str_glue('2000-01-01 {sunset}')), # Use a dummy date
+           sunrise = ymd_hms(str_glue('2000-01-01 {sunrise}'))) %>% 
+    select(year, month, day, sunrise, sunset) %>% 
+    # Convert day to an ordered factor
+    mutate(day = factor(day,
+                        levels = 1:31,
+                        ordered = TRUE)) %>% 
+    mutate(month = as.character(month)) %>% 
+    group_by(year, month) %>% 
+    nest() %>% 
+    rename(photo_period = data) 
+    
+#-- Nest data by year --#
+actograms <- data %>% 
+    mutate(month = month(date_time, 
+                         label = TRUE,
+                         abbr = FALSE)) %>% 
+    mutate(month = as.character(month)) %>% 
+    group_by(year, month) %>% 
+    nest()
+
+#-- Join actogram and photo_actogram --#
+actograms %<>% 
+    bind_cols(photo_actogram[ , 3])
+
+#-- Convert month to an ordered factor --#
+actograms %<>%
+    mutate(month = factor(month, 
+                          levels = c('January', 'February', 'March', 'April',
+                                     'May', 'June', 'July', 'August', 'September',
+                                     'October', 'November', 'December',
+                                     ordered = TRUE)))
+
+#-- Plot chronograms by month within each year --#
+actograms %<>%
+    # Prepare for plotting
+    mutate(month = as.character(month)) %>% 
+    mutate(data_binned = map(.x = data,
+                             ~ .x %>% 
+                                 # Create 30-minute bins
+                                 ## Extract minutes
+                                 mutate(time_min = minute(date_time),
+                                        time_hour = hour(date_time)) %>% 
+                                 ## Re-level minutes to 30 minute intervals
+                                 mutate(time_30 = ifelse(time_min > 0 & time_min < 35,
+                                                         yes = '00:00',
+                                                         no = '30:00'),
+                                 time_30 = str_glue('{time_hour}:{time_30}')) %>% 
+                                 # Bin by 30-min interval and calculate 
+                                 # average temperature per bin 
+                                 group_by(day, time_30) %>% 
+                                 summarise(temp_binned = mean(body_temp, na.rm = TRUE)) %>% 
+                                 # Calculate delta bin and mean daily temperature
+                                 group_by(day) %>% 
+                                 mutate(temp_delta = temp_binned - mean(temp_binned)) %>% 
+                                 ungroup() %>% 
+                                 # Make time_30 a date-time object
+                                 mutate(time_30 = str_glue('2000-01-01 {time_30}'),
+                                        time_30 = ymd_hms(time_30)) %>% 
+                                 # Generate a colour aesthestic for the 
+                                 # direction of temp_delta
+                                 mutate(col_ours = ifelse(temp_delta < 0,
+                                                          yes = 'Negative',
+                                                          no = 'Positive')) %>% 
+                                 # Convert day to an ordered factor
+                                 mutate(day = factor(day,
+                                                     levels = 1:31,
+                                                     ordered = TRUE)))) %>% 
+    # Plot data
+    mutate(actograms = pmap(.l = list(data_binned, month, year, animal, photo_period),
+                           ~ ggplot() +
+                               geom_rect(data = ..5, 
+                                         aes(xmax = sunset, 
+                                             xmin = sunrise),
+                                         ymax = Inf, 
+                                         ymin = -Inf,
+                                         fill = '#FFFFFF') +
+                               geom_col(data = ..1,
+                                        aes(x = time_30,
+                                            y = temp_delta,
+                                            fill = col_ours,
+                                            colour = col_ours)) +
+                               labs(title = str_glue('{..4}: {..2} {..3} daily actograms'), 
+                                    subtitle = 'Recordings averaged across 30-minute bins | Unshaded area: Sunrise to sunset',
+                                    x = 'Time of day',
+                                    y = expression(Delta~body~temperature~from~daily~average~(degree~C))) +
+                               scale_x_datetime(date_breaks = '180 mins',
+                                                date_labels = '%H:%M',
+                                                expand = c(0, 0)) +
+                               scale_y_continuous(breaks = 0) +
+                               scale_fill_manual(name = expression(Direction~of~Delta),
+                                                 values = c('#FD7F28', '#2678B2')) +
+                               scale_colour_manual(name = expression(Direction~of~Delta),
+                                                   values = c('#FD7F28', '#2678B2')) +
+                               facet_grid(day ~ .,
+                                          drop = FALSE) +
+                               theme_bw(base_size = 12) +
+                               theme(axis.text.y = element_blank(),
+                                     panel.grid = element_blank(),
+                                     panel.background = element_rect(fill = '#CCCCCC'),
+                                     panel.spacing.y = unit(0, 'lines'))))
+
+# Print plots
+walk(actograms$actograms, 
+     ~print(.x))
+```
+
+### Summary
+
+The figure below is the monthly average of 5-minute difference in body temperature from mean daily temperature recordings for each year. 
+
+**Please note that the sequence of months is September 2015 (orange) through to March 2016 (blue).**
+
+```{r actogram_summary, fig.height = 10, fig.width = 8}
+# Prepare photo-period data for plotting
+photo_summary <- photo_wide %>% 
+    # Extract first and last day of each month
+    group_by(month) %>% 
+    filter(day == min(day) | day == max(day)) %>% 
+    mutate(day = ifelse(day == max(day),
+                        yes = 'D2',
+                        no = 'D1')) %>% 
+    ungroup() %>% 
+    select(day, month, sunrise, sunset) %>% 
+    unique(.) 
+
+photo_D1 <- filter(photo_summary, day == 'D1') %>% 
+    mutate(sunrise = hms(sunrise),
+           sunset = hms(sunset))
+
+photo_D2 <- filter(photo_summary, day == 'D2') %>% 
+    mutate(sunrise = hms(sunrise),
+           sunset = hms(sunset))
+
+#-- Prepare summary data for plotting --#
+actogram_summary <- actograms %>%
+    # Select the required columns
+    select(year, month, data) %>% 
+    # Unnest the data
+    unnest() %>% 
+    # Group by year/month/day
+    group_by(year, month, day) %>% 
+    # Calculate mean daily temperature 
+    mutate(mean_temp = mean(body_temp)) %>% 
+    # Calculate difference between 5-min temperatures and mean daily temperature
+    mutate(delta_temp = body_temp - mean_temp) %>% 
+    # Re-group by year/month/time of day
+    group_by(year, month, time) %>% 
+    # Calculate mean at each time point across each month for each year
+    summarise(summary_temp = mean(delta_temp)) %>% 
+    ungroup() %>% 
+    # Format year/month/time columns
+    mutate(month = fct_relevel(factor(month),
+                               'January', 'February', 'March', 'September',
+                               'October', 'November', 'December'),
+           time = hms(time))
+
+#-- Plot --# 
+ggplot() +
+    geom_rect(data = photo_D1,
+              aes(xmin = sunrise,
+                  xmax = sunset),
+              ymin = -Inf,
+              ymax = Inf,
+              fill = '#FFD700',
+              colour = '#FFD700',
+              size = 1,
+              alpha = 0.4) +
+    geom_rect(data = photo_D2,
+              aes(xmin = sunrise,
+                  xmax = sunset),
+              ymin = -Inf,
+              ymax = Inf,
+              fill = '#A89070',
+              colour = '#A89070',
+              size = 1,
+              alpha = 0.4) +
+    geom_area(data = actogram_summary,
+              aes(x = time,
+                  y = summary_temp,
+                  fill = year),
+              colour = '#000000',
+              size = 0.2,
+              position = 'identity', 
+              alpha = 0.6) +
+    scale_x_time(breaks = seq(from = 0, 
+                              to = 86400, 
+                              by = 21600), # Time measured in seconds
+                 labels = c('00:00', '06:00', '12:00', 
+                            '18:00', '24:00')) + 
+    scale_fill_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    scale_colour_manual(name = 'Year',
+                        values = c('#FD7F28', '#2678B2', '#339F34')) +
+    labs(title = str_glue('{animal}: Average monthly difference in body temperature from\nmean daily temperature for each year'),
+         subtitle = 'Shaded area: Sunrise to sunset for the first (yellow) and last (tan) day of the month',
+         x = 'Time of day',
+         y = expression(Delta~body~temperature~from~daily~mean~(degree*C))) +
+    facet_grid(month ~ .,
+               drop = FALSE) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          panel.spacing.y = unit(0, 'lines'))
+```
+
+----
+
+## Timing of daily minima and maxima
+
+These analyses use hourly averages of 5-minute body temperature recordings. Median hourly temperature led to too many daily times with the same value and therefore multiple daily minima and maxima. So, we used the trimean, which produces a wider range of hourly temperature values, reducing the number of duplicate values for daily minima and maxima, while also avoiding skewing caused by acute excursions in body temperature that may occur if the arithmetic mean was used.
+
+### Density plots
+
+**Please note that the sequence of months is September 2015 (orange) through to March 2016 (blue).**
+
+```{r timing_density, fig.height = 8, fig.width = 8}
+#-- Define custom trimean function --#
+trimean <- function(x, na = TRUE) {
+    Q25 <- quantile(x, na.rm = na, probs = 0.25)[[1]]
+    Q50 <- quantile(x, na.rm = na, probs = 0.50)[[1]]
+    Q75 <- quantile(x, na.rm = na, probs = 0.75)[[1]]
+    TM <- (2 * Q50) + Q25 + Q75
+    TM <- TM / 4
+    return(TM)
+}
+
+#-- Calculate hourly trimean temp (slow)--#
+data_hour <- data %>%
+    # Round minutes to the hour (floor)
+    mutate(date_hour = floor_date(date_time, unit = 'hour')) %>%
+    # Group by data_hour and calculate trimean
+    group_by(date_hour) %>%
+    summarise(tri_mean = trimean(body_temp)) %>%
+    ungroup()
+
+#-- Find time of the minimum/maximum hourly trimean temp for each day --#
+# Minima
+data_min <- data_hour %>%
+    separate(col = date_hour,
+             into = c('date', 'hour'),
+             sep = ' ',
+             remove = FALSE) %>%
+    group_by(date) %>%
+    filter(tri_mean == min(tri_mean,
+                           na.rm = TRUE)) %>%
+    ungroup()
+
+# Maxima
+data_max <- data_hour %>%
+    separate(col = date_hour,
+             into = c('date', 'hour'),
+             sep = ' ',
+             remove = FALSE) %>%
+    group_by(date) %>%
+    filter(tri_mean == max(tri_mean,
+                           na.rm = TRUE)) %>%
+    ungroup()
+
+#-- Are there days with multiple minima/maxima? --#
+# Minima
+multi_min <- data_min %>%
+    group_by(date) %>%
+    # Get days with multiple minima
+    summarise(count = n()) %>%
+    filter(count > 1) %>%
+    ungroup() %>%
+    # Make them pretty
+    unite(col = 'days',
+          date, count,
+          sep = ' (n = ') %>%
+    mutate(days = paste0(days, ')')) %>%
+    .$days %>%
+    paste(., collapse = ', ') %>%
+    str_replace_all(pattern = '(.{39})\\s', # stuff in () is a group
+                    replacement = '\\1\n') # \1 replaces the group
+
+# Maxima
+multi_max <- data_max %>%
+    group_by(date) %>%
+    # Get days with multiple minima
+    summarise(count = n()) %>%
+    filter(count > 1) %>%
+    ungroup() %>%
+    # Make them pretty
+    unite(col = 'days',
+          date, count,
+          sep = ' (n = ') %>%
+    mutate(days = paste0(days, ')')) %>%
+    .$days %>%
+    paste(., collapse = ', ') %>%
+    str_replace_all(pattern = '(.{39})\\s', # stuff in () is a group
+                    replacement = '\\1\n') # \1 replaces the group
+
+#-- Prepare data_min/max for plotting --#
+# Minima
+data_min %<>%
+    # Extract year, month and hour of day
+    mutate(year = year(date),
+           year = as.character(year)) %>% 
+    mutate(month = month(date, 
+                         label = TRUE, 
+                         abbr = FALSE),
+           month = fct_rev(month)) %>%
+    mutate(hr = hour(date_hour)) 
+
+# Maxima
+data_max %<>%
+    # Extract year, month and hour of day
+    mutate(year = year(date),
+           year = as.character(year)) %>% 
+    mutate(month = month(date, 
+                         label = TRUE, 
+                         abbr = FALSE),
+           month = fct_rev(month)) %>%
+    mutate(hr = hour(date_hour)) 
+
+#-- Generate plot objects --#
+# Minima
+ggplot(data = data_min) +
+    aes(x = hr,
+        y = month,
+        fill = year,
+        colour = year) +
+    geom_density_ridges2(scale = 0.95, 
+                         alpha = 0.6) +
+    scale_x_continuous(breaks = c(0, 3, 6, 9, 12, 15, 18, 21),
+                       labels = c('00:00', '03:00', '06:00',
+                                  '09:00', '12:00', '15:00',
+                                  '18:00', '21:00'),
+                       limits = c(0, 23)) +
+    scale_fill_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    scale_colour_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    labs(title = str_glue('{animal}: Monthly density plot of time of body temperature minima'),
+         subtitle = '(Minima extracted from trimean hourly body temperature data)',
+         caption = str_glue('Days with multiple minima:\n {multi_min}'),
+         x = 'Hour of the day',
+         y = 'Month') +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 10,
+                                      hjust = 0))
+
+# Maxima
+ggplot(data = data_max) +
+    aes(x = hr,
+        y = month,
+        fill = year,
+        colour = year) +
+    geom_density_ridges2(scale = 0.95,
+                         alpha = 0.6) +
+    scale_x_continuous(breaks = c(0, 3, 6, 9, 12, 15, 18, 21),
+                       labels = c('00:00', '03:00', '06:00',
+                                  '09:00', '12:00', '15:00',
+                                  '18:00', '21:00'),
+                       limits = c(0, 23)) +
+    scale_fill_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    scale_colour_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    labs(title = str_glue('{animal}: Monthly density plot of time of body temperature maxima'),
+         subtitle = '(Maxima extracted from trimean hourly body temperature data)',
+         caption = str_glue('Days with multiple minima:\n {multi_max}'),
+         x = 'Hour of the day',
+         y = 'Month') +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 10,
+                                      hjust = 0))
+```
+
+### Heatmap
+
+Unlike the density plots, the days with multiple minima or maxima were excluded from the heatmap analysis.
+
+**Please note that the sequence of months is September 2015 through to March 2016.**
+
+```{r timing_heatmap, fig.height = 9, fig.width = 9}
+#-- Label maxima and minima data --#
+# Minima
+data_min %<>%
+    mutate(value = 'minimum')
+
+# Maxima
+data_max %<>%
+    mutate(value = 'maximum')
+
+#-- Filter out days with multiple max/min values --#
+# The spread function (used later) does not cope with duplicates
+
+# Fix multi_max/min for use as a filter
+## Minima
+filter_min <- str_split(string = multi_min,
+                        pattern = '\\s\\(.{5}\\)[,]\\s')[[1]] %>%
+    str_replace(pattern = '\\s\\(.{5}\\)',
+                replacement = '')
+
+## Maxima
+filter_max <- str_split(string = multi_max,
+                        pattern = '\\s\\(.{5}\\)[,]\\s')[[1]] %>%
+    str_replace(pattern = '\\s\\(.{5}\\)',
+                replacement = '')
+
+#-- Filter dataframes --#
+# Minima
+min_filtered <- data_min %>% 
+    filter(!date %in% filter_min)
+
+# Maxima
+max_filtered <- data_max %>% 
+    filter(!date %in% filter_max)
+
+#-- Generate vector of removed days --#
+multi_minmax <- c(filter_min, filter_max) %>%
+    # Filter for strings on length 10
+    .[str_detect(., '.{10}')] %>%
+    # Extract unique values
+    unique(.) %>%
+    # Sort by date
+    sort(.) %>%
+    # Collapse into a single string
+    paste(., collapse = ', ') %>%
+    # Add line-breaks
+    str_replace_all(pattern = '(.{39})\\s',
+                    replacement = '\\1\n')
+
+#-- Join min and max dataframes and organise data --#
+data_minmax <- min_filtered %>% 
+    bind_rows(max_filtered) %>%
+    # clean-up columns
+    select(date, hour, month, value) %>%
+    # Spread value column
+    spread(key = value,
+           value = hour) %>%
+    # Retain complete cases only
+    filter(complete.cases(.))
+
+#-- Calculate time in minutes between min and max --#
+data_minmax %<>%
+    mutate(interval = interval(paste(date, minimum),
+                               paste(date, maximum)),
+           length_min = interval / dminutes(1))
+
+#-- Plot --#
+data_minmax %>%
+    select(-interval) %>%
+    mutate(maximum = hour(hms(maximum)),
+           minimum = hour(hms(minimum)),
+           month = fct_rev(month)) %>%
+    arrange(date) %>%
+    ggplot(data = .) +
+    aes(x = minimum,
+        y = maximum) +
+    geom_hex(bins = 12) +
+    geom_abline(intercept = 0,
+                slope = 1,
+                colour = '#999999') +
+    scale_y_continuous(limits = c(0, 24),
+                       expand = c(0, 0),
+                       breaks = seq(0, 24, 4)) +
+    scale_x_continuous(limits = c(0, 24),
+                       expand = c(0, 0),
+                       breaks = seq(0, 24, 4)) +
+    scale_fill_viridis_c(name = 'Days') +
+    labs(title = str_glue('{animal}: Hexagonal heatmap of time of daily minima and maxima'),
+         subtitle = 'Black diagonal line: line of identity',
+         caption = str_glue('Removed days with multiple maxima or minima: \n{multi_minmax}'),
+         x = 'Time of day of minimum (hours)',
+         y = 'Time of day of maximum (hours)') +
+    facet_wrap(~ month, 
+               ncol = 3,
+               drop = FALSE) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 10,
+                                      hjust = 0))
+```
+
+### Time between daily minimum and maximum
+
+Unlike the density plots, the days with multiple minima or maxima were excluded from the heatmap analysis.
+
+**Please note that the sequence of months is September 2015 (orange) through to March 2016 (blue).**
+
+```{r timing_time, fig.height = 9, fig.width = 9}
+#-- Generate plot --#
+# Interval calculated in previous code block
+data_minmax %>% 
+    # Extract year
+    mutate(year = year(date),
+           year = as.character(year)) %>% 
+    ggplot(data = .) +
+    aes(x = length_min,
+        y = month,
+        colour = year,
+        fill = year) +
+    geom_density_ridges2(scale = 0.95,
+                         alpha = 0.6) +
+    geom_vline(xintercept = 0,
+               colour = 'red',
+               size = 1) +
+    labs(title = str_glue('{animal}: Density plot of the time difference between\ndaily minimum and maximum body temprature'),
+         caption = str_glue('Removed days with multiple maxima or minima:\n {multi_minmax}'),
+         x = 'Time difference (min - max; minutes)',
+         y = 'Season') +
+    scale_fill_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    scale_colour_manual(name = 'Year',
+                      values = c('#FD7F28', '#2678B2', '#339F34')) +
+    scale_x_continuous(limits = c(-1800, 1800),
+                       breaks = seq(-1800, 1800, 600)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 10,
+                                      hjust = 0))
+```
+
+----
+
+## Periodogram
+
+Periodograms provide an estimate of the spectral density of a signal, with the assumption being that if there is a circadian rhythm, there will be a peak in density around a frequency of 24 hours. To limit the impact that changes in photoperiod across the year may have on the phase of the rhythm, we calculated monthly periodograms rather than assessing the complete data record. We used the multitaper method of signalling processing, with seven tapers and a time-bandwidth parameter of four. 
+
+```{r periodograms}
+#-- Nest data by year and month--#
+periodgrams <- data %>% 
+    mutate(month = month(date_time, 
+                         label = TRUE,
+                         abbr = FALSE)) %>% 
+    mutate(month = as.character(month)) %>% 
+    group_by(year, month) %>% 
+    nest() %>% 
+    mutate(month = factor(month, 
+                          levels = c('January', 'February', 'March', 'April',
+                                     'May', 'June', 'July', 'August', 'September',
+                                     'October', 'November', 'December',
+                                     ordered = TRUE)))
+
+#-- Generate periodogram data for each month --#
+periodgrams %<>% 
+    # Perform spectral analysis of the time series 
+    # using the multitaper method (using default settings: nw = 4, k = 7)
+    mutate(periodogram = map(.x = data,
+                             ~ spec.mtm(ts(.x$body_temp), 
+                                        nw = 4, k = 7, 
+                                        dtUnits = 'day', 
+                                        deltat = 1/288,
+                                        jackknife = TRUE,
+                                        plot = FALSE,
+                                        log = 'yes'))) %>% 
+    # Add freq, spec, and jacknife 95% CIs into a dataframe
+    mutate(periodogram_df = map(.x = periodogram,
+                                ~ tibble(frequency = .x$freq, 
+                                         spectrum = .x$spec,
+                                         upper_CI = .x$mtm$jk$upperCI,
+                                         lower_CI = .x$mtm$jk$lowerCI)))
+    
+#-- Generate periodgram and F-value plots for each month --#
+## Days per month
+days <- map(.x = periodgrams$data, 
+            ~ round(nrow(.x) / 288))
+## Plot
+periodgrams %<>%
+    # Periodogram plots
+    mutate(periodogram_plot = pmap(.l = list(periodogram_df, 
+                                             as.character(month), 
+                                             year, animal, days),
+                                   ~ if(..5 < 16) {
+                                       ggplot(data = ..1) +
+                                       aes(x = frequency, 
+                                           y = spectrum) +
+                                       geom_blank() + 
+                                       labs(title = str_glue('{..4}: {..2} {..3} periodogram'), 
+                                            subtitle = str_glue('No plot: series length < 16 days'),
+                                            x = 'Period (days)',
+                                            y = 'Spectral density') +
+                                       scale_x_continuous(limits = c(0, 5),
+                                                          expand = c(0, 0),
+                                                          breaks = c(0.01, 0.5, 1, 
+                                                                     2, 3, 4, 5),
+                                                          labels = as.character(round(c(1/0.01, 1/0.5, 1/1, 1/2, 1/3, 1/4, 1/5), 2))) +
+                                       theme_bw(base_size = 12) +
+                                       theme(panel.grid.minor = element_blank())
+                                   } else {
+                                       ggplot(data = ..1) +
+                                       aes(x = frequency, 
+                                           y = spectrum) +
+                                       geom_ribbon(aes(ymin = lower_CI, 
+                                                       ymax = upper_CI),
+                                                   fill = 'wheat2',
+                                                   colour = 'wheat3') +
+                                       geom_line() + 
+                                       labs(title = str_glue('{..4}: {..2} {..3} periodogram'), 
+                                            subtitle = str_glue('Series length (days): {..5} \nShaded area: 95% jackknife confidence interval \nMultitaper method: time-bandwidth (nw) = 4, tapers (k) = 7'),
+                                            x = 'Period (days)',
+                                            y = 'Spectral density') +
+                                       scale_x_continuous(limits = c(0, 5),
+                                                          expand = c(0, 0),
+                                                          breaks = c(0.01, 0.5, 1, 
+                                                                     2, 3, 4, 5),
+                                                          labels = as.character(round(c(1/0.01, 1/0.5, 1/1, 1/2, 1/3, 1/4, 1/5), 2))) +
+                                       theme_bw(base_size = 12) +
+                                       theme(panel.grid.minor = element_blank())}))
+    
+# Print plots
+walk(periodgrams$periodogram_plot,
+     ~print(.x))
+```
+
+----
+
+## Autocorrelation
+
+Like the periodogram analysis, to limit the impact that changes in photoperiod across the year may have on the phase of the rhythm, we calculated autocorrelation for monthly data rather than assessing the complete data record. 
+
+In addition, we reduced the size and smoothed the data before performing the autocorrelation by averaging the 5-minute body temperature data across 48 30-minute duration bins per day. The autocorrelation was performed with a maximum lag of 480 30-minute bins (10 days). 
+
+```{r autocorrelation}
+#-- Nest data by year and month--#
+autocorr <- data %>% 
+    mutate(month = month(date_time, 
+                         label = TRUE,
+                         abbr = FALSE)) %>% 
+    mutate(month = as.character(month)) %>% 
+    group_by(year, month) %>% 
+    nest() %>% 
+    mutate(month = factor(month, 
+                          levels = c('January', 'February', 'March', 'April',
+                                     'May', 'June', 'July', 'August', 'September',
+                                     'October', 'November', 'December',
+                                     ordered = TRUE)))
+
+# Process data
+autocorr %<>% 
+    # Prepare for plotting
+    mutate(month = as.character(month)) %>% 
+    # Create 30-minute binned body temperature data
+    mutate(temp_binned = map(.x = data,
+                             ~ .x %>% 
+                                 # Extract minutes
+                                 mutate(time_min = minute(date_time),
+                                        time_hour = hour(date_time)) %>% 
+                                 # Re-level minutes to 30 minute intervals
+                                 mutate(time_30 = ifelse(time_min > 0 & time_min < 35,
+                                                         yes = '00:00',
+                                                         no = '30:00'),
+                                 time_30 = str_glue('{time_hour}:{time_30}')) %>% 
+                                 # Bin by 30-min interval and calculate 
+                                 # average temperature per bin 
+                                 group_by(day, time_30) %>% 
+                                 summarise(temp_binned = mean(body_temp, na.rm = TRUE)) %>% 
+                                 ungroup() %>%  
+                                 # Extract body_binned
+                                 .$temp_binned)) %>% 
+    # Generate acf object (autocorrelation lag.max = 10 days (n = 480))
+    mutate(ACF = map(.x = temp_binned,
+                     ~ acf(.x, 
+                           lag.max = 480,
+                           plot = FALSE))) %>%   
+    # Is the length of temp_binned less than 10 days (480 bins)
+    mutate(data_length = map(.x = temp_binned,
+                             ~ ifelse(length(.x) < 480,
+                                      yes = 'TRUE',
+                                      no = 'FALSE'))) %>%   
+    # Plot data
+    mutate(acf_plots = pmap(.l = list(ACF, as.character(month), year, animal, data_length),
+                           ~ if(..5 == 'FALSE') {
+                               autoplot(..1,
+                                        conf.int.fill = '#2678B2') +
+                               labs(title = str_glue('{..4}: {..2} {..3} autocorrelation of body temperature'),
+                                    subtitle = 'Temperature data averaged across 30-minute bins \nMaximum lag: 10 days (480 bins) \nBlue ribbon: 95% confidence interval of a white noise process',
+                                    x = 'Days',
+                                    y = 'Autocorrelation coefficient') +
+                               scale_y_continuous(breaks = seq(from = -0.4,
+                                                               to = 1,
+                                                               by = 0.2),
+                                                  limits = c(-0.4, 1.1),
+                                                  expand = c(0, 0)) +
+                               scale_x_continuous(breaks = seq(from = 0, 
+                                                               to = 480, 
+                                                               by = 48),
+                                                  labels = 0:10,
+                                                  limits = c(-5, 485),
+                                                  expand = c(0,0)) +
+                               theme_bw(base_size = 12) +
+                               theme(panel.grid.minor = element_blank())
+                               
+                               } else {
+                                   df <- data.frame(acf = ..1$acf[1:nrow(..1$acf), , 1],
+                                                    lag = ..1$lag[1:nrow(..1$lag), , 1])
+                                   
+                                   ggplot(data = df) +
+                                       aes(x = lag,
+                                           y = acf) +
+                                       geom_blank() +
+                                       labs(title = str_glue('{..4}: {..2} {..3} autocorrelation of body temperature'),
+                                            subtitle = 'No Plot: Number of days < maximum lag period (10 days)',
+                                            x = 'Days',
+                                            y = 'Autocorrelation coefficient') +
+                                       scale_y_continuous(breaks = seq(from = -0.4,
+                                                                       to = 1,
+                                                                       by = 0.2),
+                                                          limits = c(-0.4, 1.1),
+                                                          expand = c(0, 0)) +
+                                       scale_x_continuous(breaks = seq(from = 0, 
+                                                                       to = 480, 
+                                                                       by = 48),
+                                                          labels = 0:10,
+                                                          limits = c(-5, 485),
+                                                          expand = c(0,0)) +
+                                       theme_bw(base_size = 12) +
+                                       theme(panel.grid.minor = element_blank())}))
+
+# Print plots
+walk(autocorr$acf_plots, 
+     ~print(.x))
+```
+
+----
+
+## Session information
+
+```{r session_info}
+sessionInfo()
+```
